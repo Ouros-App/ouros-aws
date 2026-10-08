@@ -53,6 +53,12 @@ O workflow **Deploy to S3** é manual e restrito à branch `main`. Informe um di
 
 Como o runner do GitHub é descartável, o workflow importa o bucket existente para um estado Terraform local em cada execução antes de planejar/aplicar. O estado não é salvo como artifact ou no repositório.
 
+## Serviços de dados
+
+O workflow manual **Provision app data services** cria uma tabela DynamoDB em modo sob demanda, uma fila SQS e uma dead-letter queue. As filas usam criptografia gerenciada pelo SQS; a tabela tem proteção contra exclusão. Informe um prefixo exclusivo e a chave de partição. Os nomes gerados são `<prefix>-records`, `<prefix>-events` e `<prefix>-events-dlq`. O workflow importa recursos já existentes com esses nomes antes de aplicar; use outro prefixo para evitar adotar recursos que não pertencem a esta stack. O estado Terraform é local ao job e não é persistido.
+
+O uso de DynamoDB pode gerar cobrança por solicitações e armazenamento. As permissões disponíveis variam por laboratório; o workflow falhará sem acesso às APIs de DynamoDB ou SQS. Ele não cria roles ou policies IAM.
+
 ## EC2
 
 O workflow **Deploy to EC2 (Terraform)** prepara a sessão e valida a configuração Terraform, mas não cria instâncias. O módulo está intencionalmente sem recursos até que permissões efetivas, AMI, rede, tipo de instância e método de acesso sejam confirmados na conta Learner Lab. Depois disso, completar o módulo e habilitar `plan/apply`.
