@@ -1,14 +1,14 @@
 variable "aws_region" {
-  type = string
+  type    = string
   default = "us-east-1"
 }
 
 variable "bucket_name" {
   description = "Globally unique bucket name for the application"
-  type = string
+  type        = string
 }
 
 variable "tags" {
-  type = map(string)
+  type    = map(string)
   default = { managed_by = "terraform", project = "ouros-aws" }
 }

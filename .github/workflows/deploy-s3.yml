@@ -8,7 +8,7 @@ on:
         required: true
         default: dist
       bucket:
-        description: Existing bucket name (must be allowed by Learner Lab)
+        description: Globally unique bucket name to create or manage
         required: true
         type: string
 
@@ -26,6 +26,10 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - name: Check build output
+        env:
+          SOURCE_DIR: ${{ inputs.source_dir }}
+        run: test -d "$SOURCE_DIR" || { echo '::error::Source directory does not exist'; exit 1; }
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -35,6 +39,9 @@ jobs:
           python -m playwright install --with-deps chromium
       - name: Install AWS CLI
         run: python -m pip install --disable-pip-version-check awscli
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
       - name: Install Infisical CLI
         run: |
           curl -1sLf 'https://artifacts-cli.infisical.com/setup.deb.sh' | sudo -E bash
@@ -55,10 +62,41 @@ jobs:
             --path="$INFISICAL_PATH" \
             --domain="$INFISICAL_HOST" \
             -- python -m academy.bootstrap
+      - name: Provision S3 bucket with Terraform
+        env:
+          S3_BUCKET: ${{ inputs.bucket }}
+        run: |
+          cd terraform/s3
+          terraform init -input=false
+
+          # GitHub-hosted runners are ephemeral. Import the bucket on each run
+          # so Terraform can plan idempotently without persisting state files.
+          if aws s3api head-bucket --bucket "$S3_BUCKET" 2>/dev/null; then
+            terraform import -input=false \
+              -var="bucket_name=$S3_BUCKET" \
+              -var="aws_region=${AWS_REGION:-us-east-1}" \
+              aws_s3_bucket.site "$S3_BUCKET"
+            if aws s3api get-public-access-block --bucket "$S3_BUCKET" >/dev/null 2>&1; then
+              terraform import -input=false \
+                -var="bucket_name=$S3_BUCKET" \
+                -var="aws_region=${AWS_REGION:-us-east-1}" \
+                aws_s3_bucket_public_access_block.site "$S3_BUCKET"
+            fi
+            if aws s3api get-bucket-encryption --bucket "$S3_BUCKET" >/dev/null 2>&1; then
+              terraform import -input=false \
+                -var="bucket_name=$S3_BUCKET" \
+                -var="aws_region=${AWS_REGION:-us-east-1}" \
+                aws_s3_bucket_server_side_encryption_configuration.site "$S3_BUCKET"
+            fi
+          fi
+
+          terraform plan -input=false -out=tfplan \
+            -var="bucket_name=$S3_BUCKET" \
+            -var="aws_region=${AWS_REGION:-us-east-1}"
+          terraform apply -input=false -auto-approve tfplan
       - name: Publish files
         env:
           S3_BUCKET: ${{ inputs.bucket }}
           SOURCE_DIR: ${{ inputs.source_dir }}
         run: |
-          test -d "$SOURCE_DIR" || { echo '::error::Source directory does not exist'; exit 1; }
           aws s3 sync "$SOURCE_DIR" "s3://${S3_BUCKET}" --delete

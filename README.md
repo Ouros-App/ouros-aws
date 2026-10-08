@@ -49,7 +49,9 @@ Localmente, `GITHUB_ENV` não existe e o bootstrap recusa imprimir credenciais. 
 
 ## Deploy S3
 
-O workflow **Deploy to S3** é manual e restrito à branch `main`. Informe um diretório de saída já construído e um bucket existente permitido pelo Learner Lab. Ele sincroniza com `--delete`; revise o bucket antes de executar. A infraestrutura S3 de referência está em `terraform/s3`, mas o workflow não cria recursos implicitamente.
+O workflow **Deploy to S3** é manual e restrito à branch `main`. Informe um diretório de saída já construído e um nome de bucket globalmente único. O workflow usa Terraform para criar ou gerenciar um bucket privado com bloqueio de acesso público e criptografia padrão, depois sincroniza os arquivos com `--delete`. Revise o diretório e o nome do bucket antes de executar. O bucket não publica um site acessível publicamente.
+
+Como o runner do GitHub é descartável, o workflow importa o bucket existente para um estado Terraform local em cada execução antes de planejar/aplicar. O estado não é salvo como artifact ou no repositório.
 
 ## EC2
 
