@@ -22,6 +22,8 @@ storage-state.json
 .aws/
 __pycache__/
 .pytest_cache/
+coverage.xml
+.coverage
 .terraform/
 *.tfstate
 *.tfstate.*

@@ -49,7 +49,7 @@ Localmente, `GITHUB_ENV` não existe e o bootstrap recusa imprimir credenciais. 
 
 ## Deploy S3
 
-O workflow **Deploy to S3** é manual e restrito à branch `main`. Informe um diretório de saída já construído e um nome de bucket globalmente único. O workflow usa Terraform para criar ou gerenciar um bucket privado com bloqueio de acesso público e criptografia padrão, depois sincroniza os arquivos com `--delete`. Revise o diretório e o nome do bucket antes de executar. O bucket não publica um site acessível publicamente.
+O workflow **Deploy to S3** é manual e restrito à branch `main`. Informe um diretório que já exista no checkout da branch `main` e contenha os arquivos finais, além de um nome de bucket globalmente único. Este repositório não compila a aplicação nem baixa artefatos de outro workflow; o diretório deve estar disponível no checkout quando a ação começar. O workflow usa Terraform para criar ou gerenciar um bucket privado com bloqueio de acesso público, criptografia padrão e bloqueio de requisições sem HTTPS, depois sincroniza os arquivos com `--delete`. Para buckets existentes, ele para antes do Terraform caso já haja uma policy customizada, evitando substituí-la. Revise o diretório e o nome do bucket antes de executar. O bucket não publica um site acessível publicamente.
 
 Como o runner do GitHub é descartável, o workflow importa o bucket existente para um estado Terraform local em cada execução antes de planejar/aplicar. O estado não é salvo como artifact ou no repositório.
 
@@ -57,7 +57,7 @@ Como o runner do GitHub é descartável, o workflow importa o bucket existente p
 
 O workflow manual **Provision app data services** cria uma tabela DynamoDB em modo sob demanda, uma fila SQS e uma dead-letter queue. As filas usam criptografia gerenciada pelo SQS; a tabela tem proteção contra exclusão. Informe um prefixo exclusivo e a chave de partição. Os nomes gerados são `<prefix>-records`, `<prefix>-events` e `<prefix>-events-dlq`. O workflow importa recursos já existentes com esses nomes antes de aplicar; use outro prefixo para evitar adotar recursos que não pertencem a esta stack. O estado Terraform é local ao job e não é persistido.
 
-O uso de DynamoDB pode gerar cobrança por solicitações e armazenamento. As permissões disponíveis variam por laboratório; o workflow falhará sem acesso às APIs de DynamoDB ou SQS. Ele não cria roles ou policies IAM.
+Solicitações, armazenamento e backups contínuos do PITR podem gerar cobranças de DynamoDB; o backup é calculado com base no tamanho da tabela enquanto o recurso estiver habilitado ([detalhes da AWS](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/PointInTimeRecovery_Howitworks.html)). As permissões disponíveis variam por laboratório, então a execução falhará sem acesso às APIs de DynamoDB ou SQS. O workflow não cria roles ou policies IAM.
 
 ## EC2
 

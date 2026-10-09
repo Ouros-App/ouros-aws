@@ -1,5 +1,3 @@
-import re
-
 from .exceptions import LabStartError, LabTimeout, VocareumLoadError
 
 
@@ -14,39 +12,44 @@ def _current_lab_frame(frame):
     )
 
 
+def _lab_is_ready(page):
+    body = " ".join(page.locator("body").inner_text().lower().split())
+    return "lab status: ready" in body or "lab is ready" in body
+
+
+def _wait_for_lab(page, start, timeout_seconds):
+    for _ in range(timeout_seconds):
+        if _lab_is_ready(page):
+            return _current_lab_frame(page)
+        body = page.locator("body").inner_text().lower()
+        if "error" in body and "start lab" in body:
+            raise LabStartError("Vocareum reported a lab startup error")
+        page.wait_for_timeout(1000)
+        if not page.get_by_text("AWS", exact=True).count() and not start.count():
+            raise VocareumLoadError("Vocareum lab controls were not found")
+    raise LabTimeout("Learner Lab did not become ready before the timeout")
+
+
 def start_lab(page, timeout_seconds=300):
     try:
         page.wait_for_load_state("domcontentloaded")
         start = page.get_by_role("button", name="Start Lab", exact=True)
-        def lab_is_ready():
-            body = page.locator("body").inner_text().lower()
-            return bool(re.search(r"lab\s+status:\s*ready", body) or "lab is ready" in body)
-
-        if lab_is_ready():
+        if _lab_is_ready(page):
             return _current_lab_frame(page)
         try:
             start.wait_for(state="visible", timeout=30000)
         except Exception:
-            if not lab_is_ready():
+            if not _lab_is_ready(page):
                 raise VocareumLoadError("Vocareum lab controls did not finish loading")
         if start.count() and start.first.is_visible():
             start.first.click()
         # Vocareum status indicators vary; use accessible labels/text and common
         # status attributes instead of coordinates. Polling is bounded.
-        for _ in range(timeout_seconds):
-            if lab_is_ready():
-                return _current_lab_frame(page)
-            body = page.locator("body").inner_text().lower()
-            if "error" in body and "start lab" in body:
-                raise LabStartError("Vocareum reported a lab startup error")
-            page.wait_for_timeout(1000)
-            if not page.get_by_text("AWS", exact=True).count() and not start.count():
-                raise VocareumLoadError("Vocareum lab controls were not found")
+        return _wait_for_lab(page, start, timeout_seconds)
     except (LabStartError, VocareumLoadError):
         raise
     except Exception as exc:
         raise LabStartError(f"Could not start the Learner Lab ({type(exc).__name__})") from exc
-    raise LabTimeout("Learner Lab did not become ready before the timeout")
 
 
 def open_aws_details(page):

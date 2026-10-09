@@ -3,7 +3,10 @@ resource "aws_dynamodb_table" "records" {
   billing_mode                = "PAY_PER_REQUEST"
   hash_key                    = var.partition_key_name
   deletion_protection_enabled = true
-  tags                        = var.tags
+  point_in_time_recovery {
+    enabled = true
+  }
+  tags = var.tags
 
   attribute {
     name = var.partition_key_name

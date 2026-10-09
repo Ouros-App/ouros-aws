@@ -3,9 +3,9 @@ import re
 
 from .exceptions import AwsDetailsNotFound, CredentialsInvalid
 
-_KEY = re.compile(r"(?:\bAWS_ACCESS_KEY_ID\b|\bAccessKey\b)\s*[:=]?\s*([A-Z0-9]{16,})", re.I)
-_SECRET = re.compile(r"(?:\bAWS_SECRET_ACCESS_KEY\b|\bSecretKey\b)\s*[:=]?\s*([A-Za-z0-9/+=]{30,})", re.I)
-_TOKEN = re.compile(r"(?:\bAWS_SESSION_TOKEN\b|\bSessionToken\b)\s*[:=]?\s*([A-Za-z0-9/+=_-]{30,})", re.I)
+_KEY = re.compile(r"(?:\bAWS_ACCESS_KEY_ID\b|\bAccessKey\b)[ \t]{0,20}[:=]?[ \t]{0,20}([A-Z0-9]{16,})", re.I)
+_SECRET = re.compile(r"(?:\bAWS_SECRET_ACCESS_KEY\b|\bSecretKey\b)[ \t]{0,20}[:=]?[ \t]{0,20}([A-Za-z0-9/+=]{30,})", re.I)
+_TOKEN = re.compile(r"(?:\bAWS_SESSION_TOKEN\b|\bSessionToken\b)[ \t]{0,20}[:=]?[ \t]{0,20}([A-Za-z0-9/+=_-]{30,})", re.I)
 
 
 def parse_aws_details(text, region="us-east-1"):
