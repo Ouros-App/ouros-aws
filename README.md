@@ -1,2 +1,70 @@
 # ouros-aws
-Gerenciador do console AWS
+
+Automação de healthcheck para iniciar o AWS Academy Learner Lab pelo Canvas/Vocareum e disponibilizar as credenciais fornecidas pelo laboratório ao job do GitHub Actions.
+
+## Arquitetura
+
+O workflow lê as credenciais do Canvas e a região da AWS do Infisical (`/aws-academy`), automatiza Canvas e Vocareum com Playwright, abre **Details → AWS: Show** e grava as credenciais somente no ambiente do runner. O painel atual fornece access key e secret key; se também fornecer um session token, ele será exportado. Em seguida, o fluxo valida a sessão com `aws sts get-caller-identity`. As credenciais não são gravadas em artefatos nem no repositório.
+
+## Configuração
+
+No GitHub → Settings → Secrets and variables → Actions, cadastre os cinco itens abaixo como **Secrets**, com os nomes exatamente assim:
+
+| Secret GitHub | Valor esperado |
+| --- | --- |
+| `INFISICAL_TOKEN` | Token de acesso aceito pela CLI do Infisical |
+| `INFISICAL_PROJECT_ID` | ID do projeto Infisical (não o slug) |
+| `INFISICAL_ENV` | Slug do ambiente, por exemplo `dev` ou `prod` |
+| `INFISICAL_PATH` | Path dos secrets, por exemplo `/aws-academy` |
+| `INFISICAL_HOST` | URL da instalação, por exemplo `https://app.infisical.com` |
+
+O token deve ter permissão de leitura somente no projeto, ambiente e path necessários. Os workflows passam esses valores à Infisical CLI e carregam as configurações do Canvas no processo do bootstrap.
+
+No Infisical, crie no path `/aws-academy`:
+
+| Secret | Obrigatório | Uso |
+| --- | --- | --- |
+| `CANVAS_USERNAME` | sim | Login Canvas |
+| `CANVAS_PASSWORD` | sim | Senha Canvas |
+| `CANVAS_LOGIN_URL` | sim | URL do login institucional |
+| `AWS_REGION` | não | Região padrão, default `us-east-1` |
+| `CANVAS_COURSE_NAME` | não | Nome do curso |
+| `CANVAS_LAB_LINK_TEXT` | não | Link do módulo Canvas; padrão `Sandbox Environment` |
+
+O login institucional pode exigir MFA ou CAPTCHA. O fluxo não tenta contornar esses controles; se forem apresentados, o healthcheck falhará e será necessário um fluxo permitido pela instituição.
+
+## Healthcheck
+
+Execute manualmente **AWS Academy healthcheck** em Actions → workflow_dispatch. O job instala Chromium, carrega configuração do Infisical, inicia o laboratório e valida a identidade STS. Nenhum deploy é feito.
+
+Para desenvolvimento local, instale Python, AWS CLI e Playwright, carregue as variáveis por um mecanismo seguro e rode:
+
+```bash
+python -m pip install -r requirements.txt
+python -m playwright install chromium
+python -m academy.bootstrap
+```
+
+Localmente, `GITHUB_ENV` não existe e o bootstrap recusa imprimir credenciais. Para validar manualmente, adapte o uso para um mecanismo temporário seguro; não salve as credenciais em arquivos persistentes.
+
+## Deploy S3
+
+O workflow **Deploy to S3** é manual e restrito à branch `main`. Informe um diretório que já exista no checkout da branch `main` e contenha os arquivos finais, além de um nome de bucket globalmente único. Este repositório não compila a aplicação nem baixa artefatos de outro workflow; o diretório deve estar disponível no checkout quando a ação começar. O workflow usa Terraform para criar ou gerenciar um bucket privado com bloqueio de acesso público, criptografia padrão, bloqueio de requisições sem HTTPS e logs de acesso retidos por 30 dias; depois sincroniza os arquivos com `--delete`. Para buckets existentes, ele para antes do Terraform caso já haja uma policy customizada, criptografia diferente de SSE-S3 ou outro destino de logs, evitando substituí-los. Revise o diretório e o nome do bucket antes de executar. O bucket não publica um site acessível publicamente. O armazenamento dos arquivos de log pode gerar cobranças adicionais.
+
+Como o runner do GitHub é descartável, o workflow importa o bucket existente para um estado Terraform local em cada execução antes de planejar/aplicar. O estado não é salvo como artifact ou no repositório.
+
+## Serviços de dados
+
+O workflow manual **Provision app data services** cria uma tabela DynamoDB em modo sob demanda, uma fila SQS e uma dead-letter queue. As filas usam criptografia gerenciada pelo SQS; a tabela tem proteção contra exclusão. Informe um prefixo exclusivo e a chave de partição. Os nomes gerados são `<prefix>-records`, `<prefix>-events` e `<prefix>-events-dlq`. O workflow importa recursos já existentes com esses nomes antes de aplicar; use outro prefixo para evitar adotar recursos que não pertencem a esta stack. O estado Terraform é local ao job e não é persistido.
+
+Solicitações, armazenamento e backups contínuos do PITR podem gerar cobranças de DynamoDB; o backup é calculado com base no tamanho da tabela enquanto o recurso estiver habilitado ([detalhes da AWS](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/PointInTimeRecovery_Howitworks.html)). As permissões disponíveis variam por laboratório, então a execução falhará sem acesso às APIs de DynamoDB ou SQS. O workflow não cria roles ou policies IAM.
+
+## EC2
+
+O workflow **Deploy to EC2 (Terraform)** prepara a sessão e valida a configuração Terraform, mas não cria instâncias. O módulo está intencionalmente sem recursos até que permissões efetivas, AMI, rede, tipo de instância e método de acesso sejam confirmados na conta Learner Lab. Depois disso, completar o módulo e habilitar `plan/apply`.
+
+## Erros comuns
+
+O bootstrap reporta códigos como `CANVAS_LOGIN_FAILED`, `COURSE_NOT_FOUND`, `LEARNER_LAB_NOT_FOUND`, `LAB_TIMEOUT`, `AWS_DETAILS_NOT_FOUND`, `AWS_CREDENTIALS_INVALID` e `STS_VALIDATION_FAILED`. O portal pode alterar rótulos e seletores; ajuste os nomes em `CANVAS_COURSE_NAME` e `CANVAS_LAB_LINK_TEXT` ou os seletores centralizados em `academy/`.
+
+Não deixe recursos do Learner Lab ativos além do necessário. Trocar de conta exige atualizar `CANVAS_USERNAME` e `CANVAS_PASSWORD` no Infisical.

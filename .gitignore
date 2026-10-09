@@ -1,6 +1,7 @@
 # Environment
 .env
 .env.*
+!.env.example
 
 # Build artifacts
 dist/
@@ -12,3 +13,18 @@ temp/
 .DS_Store
 .idea/
 .vscode/
+
+# Playwright and AWS
+playwright-report/
+test-results/
+storage-state.json
+*.pem
+.aws/
+__pycache__/
+.pytest_cache/
+coverage.xml
+.coverage
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log

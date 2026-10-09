@@ -1,0 +1,250 @@
+name: Deploy to S3
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_dir:
+        description: Existing directory in the main checkout containing built files
+        required: true
+      bucket:
+        description: Globally unique bucket name to create or manage
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-s3-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check build output
+        env:
+          SOURCE_DIR: ${{ inputs.source_dir }}
+        run: test -d "$SOURCE_DIR" || { echo '::error::Source directory does not exist'; exit 1; }
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install browser dependencies
+        run: |
+          python -m pip install --disable-pip-version-check -r requirements.txt
+          python -m playwright install --with-deps chromium
+      - name: Install AWS CLI
+        run: python -m pip install --disable-pip-version-check awscli
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+      - name: Install Infisical CLI
+        run: |
+          curl -1sLf 'https://artifacts-cli.infisical.com/setup.deb.sh' | sudo -E bash
+          sudo apt-get update
+          sudo apt-get install -y infisical
+      - name: Prepare Academy credentials
+        env:
+          INFISICAL_TOKEN: ${{ secrets.INFISICAL_TOKEN }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_PROJECT_ID }}
+          INFISICAL_ENV: ${{ secrets.INFISICAL_ENV }}
+          INFISICAL_PATH: ${{ secrets.INFISICAL_PATH }}
+          INFISICAL_HOST: ${{ secrets.INFISICAL_HOST }}
+        run: |
+          infisical run \
+            --token="$INFISICAL_TOKEN" \
+            --projectId="$INFISICAL_PROJECT_ID" \
+            --env="$INFISICAL_ENV" \
+            --path="$INFISICAL_PATH" \
+            --domain="$INFISICAL_HOST" \
+            -- python -m academy.bootstrap
+      - name: Provision S3 bucket with Terraform
+        env:
+          S3_BUCKET: ${{ inputs.bucket }}
+        run: |
+          cd terraform/s3
+          terraform init -input=false
+          LOG_BUCKET="$(python -c 'import hashlib,sys; name=sys.argv[1]; print(name[:50] + "-logs-" + hashlib.sha256(name.encode()).hexdigest()[:6])' "$S3_BUCKET")"
+
+          # GitHub-hosted runners are ephemeral. Import the bucket on each run
+          # so Terraform can plan idempotently without persisting state files.
+          if aws s3api head-bucket --bucket "$S3_BUCKET" 2>/dev/null; then
+            import_https_policy=false
+            import_site_logging=false
+            policy_error="$RUNNER_TEMP/s3-policy-error.txt"
+            bucket_policy="$RUNNER_TEMP/s3-bucket-policy.json"
+            if aws s3api get-bucket-policy --bucket "$S3_BUCKET" --query Policy --output text >"$bucket_policy" 2>"$policy_error"; then
+              if jq -e --arg bucket_arn "arn:aws:s3:::$S3_BUCKET" '
+                (.Statement | type == "array" and length == 1) and
+                .Statement[0].Sid == "DenyInsecureTransport" and
+                .Statement[0].Effect == "Deny" and
+                .Statement[0].Action == "s3:*" and
+                .Statement[0].Principal == "*" and
+                (.Statement[0].Resource | type == "array" and length == 2 and sort == [$bucket_arn, ($bucket_arn + "/*")]) and
+                .Statement[0].Condition.Bool["aws:SecureTransport"] == "false"
+              ' "$bucket_policy" >/dev/null; then
+                import_https_policy=true
+              else
+                echo '::error::The existing bucket has a policy this workflow cannot safely replace. Merge the HTTPS-only deny rule manually before deploying.'
+                exit 1
+              fi
+            elif ! grep -q 'NoSuchBucketPolicy' "$policy_error"; then
+              cat "$policy_error" >&2
+              echo '::error::Could not safely inspect the existing bucket policy.'
+              exit 1
+            fi
+
+            encryption_error="$RUNNER_TEMP/s3-encryption-error.txt"
+            if sse_algorithm="$(aws s3api get-bucket-encryption --bucket "$S3_BUCKET" \
+              --query 'ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm' \
+              --output text 2>"$encryption_error")"; then
+              if [ "$sse_algorithm" != "AES256" ]; then
+                echo "::error::Existing bucket encryption uses $sse_algorithm; this workflow only preserves AES256 and will not change its encryption."
+                exit 1
+              fi
+            elif ! grep -q 'ServerSideEncryptionConfigurationNotFoundError' "$encryption_error"; then
+              cat "$encryption_error" >&2
+              echo '::error::Could not safely inspect the existing bucket encryption configuration.'
+              exit 1
+            fi
+
+            source_logging="$RUNNER_TEMP/s3-source-logging.json"
+            logging_error="$RUNNER_TEMP/s3-logging-error.txt"
+            if ! aws s3api get-bucket-logging --bucket "$S3_BUCKET" >"$source_logging" 2>"$logging_error"; then
+              cat "$logging_error" >&2
+              echo '::error::Could not safely inspect the existing bucket logging configuration.'
+              exit 1
+            fi
+            if jq -e '.LoggingEnabled.TargetBucket' "$source_logging" >/dev/null; then
+              current_log_bucket="$(jq -r '.LoggingEnabled.TargetBucket' "$source_logging")"
+              if [ "$current_log_bucket" != "$LOG_BUCKET" ] || ! jq -e --arg prefix "$S3_BUCKET/" '.LoggingEnabled.TargetPrefix == $prefix' "$source_logging" >/dev/null; then
+                echo "::error::The existing bucket has a different logging destination or prefix; this workflow will not replace it."
+                exit 1
+              fi
+              import_site_logging=true
+            fi
+
+            terraform import -input=false \
+              -var="bucket_name=$S3_BUCKET" \
+              -var="aws_region=${AWS_REGION:-us-east-1}" \
+              aws_s3_bucket.site "$S3_BUCKET"
+            if [ "$import_https_policy" = true ]; then
+              terraform import -input=false \
+                -var="bucket_name=$S3_BUCKET" \
+                -var="aws_region=${AWS_REGION:-us-east-1}" \
+                aws_s3_bucket_policy.https_only "$S3_BUCKET"
+            fi
+            if aws s3api get-public-access-block --bucket "$S3_BUCKET" >/dev/null 2>&1; then
+              terraform import -input=false \
+                -var="bucket_name=$S3_BUCKET" \
+                -var="aws_region=${AWS_REGION:-us-east-1}" \
+                aws_s3_bucket_public_access_block.site "$S3_BUCKET"
+            fi
+            if [ "${sse_algorithm:-}" = "AES256" ]; then
+              terraform import -input=false \
+                -var="bucket_name=$S3_BUCKET" \
+                -var="aws_region=${AWS_REGION:-us-east-1}" \
+                aws_s3_bucket_server_side_encryption_configuration.site "$S3_BUCKET"
+            fi
+          fi
+
+          # Import the dedicated logging bucket's managed settings when it
+          # already exists; refuse custom policies, encryption, or lifecycle.
+          if aws s3api head-bucket --bucket "$LOG_BUCKET" 2>/dev/null; then
+            terraform import -input=false \
+              -var="bucket_name=$S3_BUCKET" \
+              -var="aws_region=${AWS_REGION:-us-east-1}" \
+              aws_s3_bucket.access_logs "$LOG_BUCKET"
+
+            if aws s3api get-public-access-block --bucket "$LOG_BUCKET" >/dev/null 2>&1; then
+              terraform import -input=false \
+                -var="bucket_name=$S3_BUCKET" \
+                -var="aws_region=${AWS_REGION:-us-east-1}" \
+                aws_s3_bucket_public_access_block.access_logs "$LOG_BUCKET"
+            fi
+
+            logs_encryption_error="$RUNNER_TEMP/s3-logs-encryption-error.txt"
+            if logs_sse_algorithm="$(aws s3api get-bucket-encryption --bucket "$LOG_BUCKET" \
+              --query 'ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm' \
+              --output text 2>"$logs_encryption_error")"; then
+              if [ "$logs_sse_algorithm" != "AES256" ]; then
+                echo "::error::The access-log bucket uses $logs_sse_algorithm encryption; this workflow requires SSE-S3 for log delivery."
+                exit 1
+              fi
+              terraform import -input=false \
+                -var="bucket_name=$S3_BUCKET" \
+                -var="aws_region=${AWS_REGION:-us-east-1}" \
+                aws_s3_bucket_server_side_encryption_configuration.access_logs "$LOG_BUCKET"
+            elif ! grep -q 'ServerSideEncryptionConfigurationNotFoundError' "$logs_encryption_error"; then
+              cat "$logs_encryption_error" >&2
+              echo '::error::Could not safely inspect access-log bucket encryption.'
+              exit 1
+            fi
+
+            logs_policy_error="$RUNNER_TEMP/s3-logs-policy-error.txt"
+            logs_policy="$RUNNER_TEMP/s3-logs-bucket-policy.json"
+            if aws s3api get-bucket-policy --bucket "$LOG_BUCKET" --query Policy --output text >"$logs_policy" 2>"$logs_policy_error"; then
+              logs_account_id="$(aws sts get-caller-identity --query Account --output text)"
+              if jq -e --arg log_arn "arn:aws:s3:::$LOG_BUCKET" --arg source_arn "arn:aws:s3:::$S3_BUCKET" --arg source_bucket "$S3_BUCKET" --arg account_id "$logs_account_id" '
+                (.Statement | type == "array" and length == 2) and
+                ([.Statement[].Sid] | sort == ["AllowS3ServerAccessLogs", "DenyInsecureTransport"]) and
+                any(.Statement[]; .Sid == "AllowS3ServerAccessLogs" and .Effect == "Allow" and .Principal.Service == "logging.s3.amazonaws.com" and .Action == "s3:PutObject" and .Resource == ($log_arn + "/" + $source_bucket + "/*") and .Condition.ArnLike["aws:SourceArn"] == $source_arn and .Condition.StringEquals["aws:SourceAccount"] == $account_id) and
+                any(.Statement[]; .Sid == "DenyInsecureTransport" and .Effect == "Deny" and .Action == "s3:*" and .Principal == "*" and (.Resource | type == "array" and length == 2 and sort == [$log_arn, ($log_arn + "/*")]) and .Condition.Bool["aws:SecureTransport"] == "false")
+              ' "$logs_policy" >/dev/null; then
+                terraform import -input=false \
+                  -var="bucket_name=$S3_BUCKET" \
+                  -var="aws_region=${AWS_REGION:-us-east-1}" \
+                  aws_s3_bucket_policy.access_logs "$LOG_BUCKET"
+              else
+                echo '::error::The access-log bucket has a custom policy this workflow cannot safely replace.'
+                exit 1
+              fi
+            elif ! grep -q 'NoSuchBucketPolicy' "$logs_policy_error"; then
+              cat "$logs_policy_error" >&2
+              echo '::error::Could not safely inspect access-log bucket policy.'
+              exit 1
+            fi
+
+            logs_lifecycle_error="$RUNNER_TEMP/s3-logs-lifecycle-error.txt"
+            logs_lifecycle="$RUNNER_TEMP/s3-logs-lifecycle.json"
+            if aws s3api get-bucket-lifecycle-configuration --bucket "$LOG_BUCKET" >"$logs_lifecycle" 2>"$logs_lifecycle_error"; then
+              if jq -e --arg prefix "$S3_BUCKET/" '
+                .Rules == [{"ID":"expire-access-logs","Filter":{"Prefix":$prefix},"Status":"Enabled","Expiration":{"Days":30}}]
+              ' "$logs_lifecycle" >/dev/null; then
+                terraform import -input=false \
+                  -var="bucket_name=$S3_BUCKET" \
+                  -var="aws_region=${AWS_REGION:-us-east-1}" \
+                  aws_s3_bucket_lifecycle_configuration.access_logs "$LOG_BUCKET"
+              else
+                echo '::error::The access-log bucket has a custom lifecycle configuration this workflow cannot safely replace.'
+                exit 1
+              fi
+            elif ! grep -q 'NoSuchLifecycleConfiguration' "$logs_lifecycle_error"; then
+              cat "$logs_lifecycle_error" >&2
+              echo '::error::Could not safely inspect access-log bucket lifecycle.'
+              exit 1
+            fi
+
+            if [ "$import_site_logging" = true ]; then
+              terraform import -input=false \
+                -var="bucket_name=$S3_BUCKET" \
+                -var="aws_region=${AWS_REGION:-us-east-1}" \
+                aws_s3_bucket_logging.site "$S3_BUCKET"
+            fi
+          fi
+
+          terraform plan -input=false -out=tfplan \
+            -var="bucket_name=$S3_BUCKET" \
+            -var="aws_region=${AWS_REGION:-us-east-1}"
+          terraform apply -input=false -auto-approve tfplan
+      - name: Publish files
+        env:
+          S3_BUCKET: ${{ inputs.bucket }}
+          SOURCE_DIR: ${{ inputs.source_dir }}
+        run: |
+          aws s3 sync "$SOURCE_DIR" "s3://${S3_BUCKET}" --delete

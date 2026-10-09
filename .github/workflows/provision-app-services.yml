@@ -1,0 +1,129 @@
+name: Provision app data services
+
+on:
+  workflow_dispatch:
+    inputs:
+      name_prefix:
+        description: Unique lowercase prefix for the DynamoDB table and SQS queues
+        required: true
+        default: ouros-app-demo
+        type: string
+      partition_key_name:
+        description: String partition key name for the DynamoDB table
+        required: true
+        default: id
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: provision-app-services-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  provision:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install browser dependencies
+        run: |
+          python -m pip install --disable-pip-version-check -r requirements.txt
+          python -m playwright install --with-deps chromium
+      - name: Install AWS CLI
+        run: python -m pip install --disable-pip-version-check awscli
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+      - name: Install Infisical CLI
+        run: |
+          curl -1sLf 'https://artifacts-cli.infisical.com/setup.deb.sh' | sudo -E bash
+          sudo apt-get update
+          sudo apt-get install -y infisical
+      - name: Prepare Academy credentials
+        env:
+          INFISICAL_TOKEN: ${{ secrets.INFISICAL_TOKEN }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_PROJECT_ID }}
+          INFISICAL_ENV: ${{ secrets.INFISICAL_ENV }}
+          INFISICAL_PATH: ${{ secrets.INFISICAL_PATH }}
+          INFISICAL_HOST: ${{ secrets.INFISICAL_HOST }}
+        run: |
+          infisical run \
+            --token="$INFISICAL_TOKEN" \
+            --projectId="$INFISICAL_PROJECT_ID" \
+            --env="$INFISICAL_ENV" \
+            --path="$INFISICAL_PATH" \
+            --domain="$INFISICAL_HOST" \
+            -- python -m academy.bootstrap
+      - name: Import existing resources and apply Terraform
+        working-directory: terraform/app-services
+        env:
+          NAME_PREFIX: ${{ inputs.name_prefix }}
+          PARTITION_KEY_NAME: ${{ inputs.partition_key_name }}
+        run: |
+          TABLE_NAME="${NAME_PREFIX}-records"
+          EVENTS_QUEUE_NAME="${NAME_PREFIX}-events"
+          DLQ_NAME="${NAME_PREFIX}-events-dlq"
+          REGION="${AWS_REGION:-us-east-1}"
+
+          terraform init -input=false
+
+          # The hosted runner is ephemeral. Import existing resources into a
+          # local state for this run so repeated dispatches remain idempotent.
+          if aws dynamodb describe-table --table-name "$TABLE_NAME" >/dev/null 2>&1; then
+            terraform import -input=false \
+              -var="name_prefix=$NAME_PREFIX" \
+              -var="partition_key_name=$PARTITION_KEY_NAME" \
+              -var="aws_region=$REGION" \
+              aws_dynamodb_table.records "$TABLE_NAME"
+          fi
+
+          DLQ_URL="$(aws sqs get-queue-url --queue-name "$DLQ_NAME" --query QueueUrl --output text 2>/dev/null || true)"
+          if [ -n "$DLQ_URL" ] && [ "$DLQ_URL" != "None" ]; then
+            terraform import -input=false \
+              -var="name_prefix=$NAME_PREFIX" \
+              -var="partition_key_name=$PARTITION_KEY_NAME" \
+              -var="aws_region=$REGION" \
+              aws_sqs_queue.dead_letter "$DLQ_URL"
+          fi
+
+          EVENTS_URL="$(aws sqs get-queue-url --queue-name "$EVENTS_QUEUE_NAME" --query QueueUrl --output text 2>/dev/null || true)"
+          if [ -n "$EVENTS_URL" ] && [ "$EVENTS_URL" != "None" ]; then
+            terraform import -input=false \
+              -var="name_prefix=$NAME_PREFIX" \
+              -var="partition_key_name=$PARTITION_KEY_NAME" \
+              -var="aws_region=$REGION" \
+              aws_sqs_queue.events "$EVENTS_URL"
+          fi
+
+          terraform plan -input=false -out=tfplan \
+            -var="name_prefix=$NAME_PREFIX" \
+            -var="partition_key_name=$PARTITION_KEY_NAME" \
+            -var="aws_region=$REGION"
+
+          plan_json="$RUNNER_TEMP/app-services-plan.json"
+          terraform show -json tfplan > "$plan_json"
+          unsafe_changes="$(jq -r '
+            [.resource_changes[]?
+              | select(
+                  (.change.actions | index("delete")) != null or
+                  (.type == "aws_sqs_queue" and .name == "events" and
+                    (.change.before.message_retention_seconds // 0) >
+                    (.change.after.message_retention_seconds // 0))
+                )
+              | .address]
+            | .[]
+          ' "$plan_json")"
+          if [ -n "$unsafe_changes" ]; then
+            printf '::error::Terraform plan contains destructive changes or reduces event queue retention:\n%s\n' "$unsafe_changes"
+            exit 1
+          fi
+
+          terraform apply -input=false -auto-approve tfplan
