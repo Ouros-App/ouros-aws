@@ -25,23 +25,23 @@ def _login(page, config):
 
 
 def _open_course(page, config):
-    course = page.get_by_role("link", name=config["course_name"], exact=False)
-    if not course.count():
-        course = page.get_by_text(config["course_name"], exact=False)
-    if not course.count() or not course.first.is_visible():
-        course = page.get_by_role("link", name="AWS Academy Cloud Foundations", exact=False)
+    course = _course_locator(page, config["course_name"])
+    try:
+        course.first.wait_for(state="visible", timeout=config["timeout_ms"])
+    except Exception:
+        course = _course_locator(page, "AWS Academy Cloud Foundations")
         try:
             course.first.wait_for(state="visible", timeout=config["timeout_ms"])
-        except Exception:
-            course = page.get_by_text("AWS Academy Cloud Foundations", exact=False)
-            try:
-                course.first.wait_for(state="visible", timeout=1000)
-            except Exception as exc:
-                raise CourseNotFound("AWS Academy course was not found") from exc
-    else:
-        course.first.wait_for(state="visible", timeout=config["timeout_ms"])
+        except Exception as exc:
+            raise CourseNotFound("AWS Academy course was not found") from exc
     course.first.click()
     print("[academy] Academy course opened")
+
+
+def _course_locator(page, course_name):
+    return page.get_by_role("link", name=course_name, exact=False).or_(
+        page.get_by_text(course_name, exact=False)
+    )
 
 
 def _open_modules(page):

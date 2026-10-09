@@ -107,4 +107,23 @@ jobs:
             -var="name_prefix=$NAME_PREFIX" \
             -var="partition_key_name=$PARTITION_KEY_NAME" \
             -var="aws_region=$REGION"
+
+          plan_json="$RUNNER_TEMP/app-services-plan.json"
+          terraform show -json tfplan > "$plan_json"
+          unsafe_changes="$(jq -r '
+            [.resource_changes[]?
+              | select(
+                  (.change.actions | index("delete")) != null or
+                  (.type == "aws_sqs_queue" and .name == "events" and
+                    (.change.before.message_retention_seconds // 0) >
+                    (.change.after.message_retention_seconds // 0))
+                )
+              | .address]
+            | .[]
+          ' "$plan_json")"
+          if [ -n "$unsafe_changes" ]; then
+            printf '::error::Terraform plan contains destructive changes or reduces event queue retention:\n%s\n' "$unsafe_changes"
+            exit 1
+          fi
+
           terraform apply -input=false -auto-approve tfplan

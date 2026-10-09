@@ -17,7 +17,7 @@ def _lab_is_ready(page):
     return "lab status: ready" in body or "lab is ready" in body
 
 
-def _wait_for_lab(page, start, timeout_seconds):
+def _wait_for_lab(page, timeout_seconds):
     for _ in range(timeout_seconds):
         if _lab_is_ready(page):
             return _current_lab_frame(page)
@@ -25,8 +25,6 @@ def _wait_for_lab(page, start, timeout_seconds):
         if "error" in body and "start lab" in body:
             raise LabStartError("Vocareum reported a lab startup error")
         page.wait_for_timeout(1000)
-        if not page.get_by_text("AWS", exact=True).count() and not start.count():
-            raise VocareumLoadError("Vocareum lab controls were not found")
     raise LabTimeout("Learner Lab did not become ready before the timeout")
 
 
@@ -45,8 +43,8 @@ def start_lab(page, timeout_seconds=300):
             start.first.click()
         # Vocareum status indicators vary; use accessible labels/text and common
         # status attributes instead of coordinates. Polling is bounded.
-        return _wait_for_lab(page, start, timeout_seconds)
-    except (LabStartError, VocareumLoadError):
+        return _wait_for_lab(page, timeout_seconds)
+    except (LabStartError, LabTimeout, VocareumLoadError):
         raise
     except Exception as exc:
         raise LabStartError(f"Could not start the Learner Lab ({type(exc).__name__})") from exc

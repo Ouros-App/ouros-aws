@@ -1,11 +1,13 @@
 import os
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+from academy.canvas import _open_course
 from academy.config import load_config
 from academy.credentials import export_github_env, parse_aws_details
-from academy.exceptions import AwsDetailsNotFound, ConfigurationError, CredentialsInvalid
+from academy.exceptions import AwsDetailsNotFound, ConfigurationError, CredentialsInvalid, LabTimeout
+from academy.vocareum import start_lab
 
 
 class ConfigTests(unittest.TestCase):
@@ -87,6 +89,41 @@ class CredentialTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             export_github_env(values)
             self.assertEqual(os.environ["AWS_REGION"], "us-east-1")
+
+
+class NavigationTests(unittest.TestCase):
+    def test_waits_for_configured_course_before_using_fallback(self):
+        configured_course = Mock()
+        fallback_course = Mock()
+        page = Mock()
+        config = {"course_name": "Configured course", "timeout_ms": 12000}
+
+        with patch(
+            "academy.canvas._course_locator",
+            side_effect=[configured_course, fallback_course],
+        ):
+            _open_course(page, config)
+
+        configured_course.first.wait_for.assert_called_once_with(
+            state="visible", timeout=12000
+        )
+        configured_course.first.click.assert_called_once_with()
+        fallback_course.first.wait_for.assert_not_called()
+
+    def test_missing_start_controls_can_timeout_without_being_reclassified(self):
+        page = Mock()
+        page.locator.return_value.inner_text.return_value = "Starting lab"
+        start_button = Mock()
+        start_button.count.side_effect = [1, 0]
+        start_button.first.is_visible.return_value = True
+        page.get_by_role.return_value = start_button
+        start_button.wait_for.return_value = None
+
+        with self.assertRaises(LabTimeout):
+            start_lab(page, timeout_seconds=2)
+
+        self.assertEqual(page.wait_for_timeout.call_count, 2)
+        start_button.count.assert_called_once_with()
 
 
 if __name__ == "__main__":

@@ -114,7 +114,12 @@ jobs:
             fi
 
             source_logging="$RUNNER_TEMP/s3-source-logging.json"
-            aws s3api get-bucket-logging --bucket "$S3_BUCKET" >"$source_logging"
+            logging_error="$RUNNER_TEMP/s3-logging-error.txt"
+            if ! aws s3api get-bucket-logging --bucket "$S3_BUCKET" >"$source_logging" 2>"$logging_error"; then
+              cat "$logging_error" >&2
+              echo '::error::Could not safely inspect the existing bucket logging configuration.'
+              exit 1
+            fi
             if jq -e '.LoggingEnabled.TargetBucket' "$source_logging" >/dev/null; then
               current_log_bucket="$(jq -r '.LoggingEnabled.TargetBucket' "$source_logging")"
               if [ "$current_log_bucket" != "$LOG_BUCKET" ] || ! jq -e --arg prefix "$S3_BUCKET/" '.LoggingEnabled.TargetPrefix == $prefix' "$source_logging" >/dev/null; then
