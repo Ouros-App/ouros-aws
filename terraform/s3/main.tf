@@ -14,7 +14,7 @@ resource "aws_s3_bucket" "site" {
   tags          = var.tags
 }
 
-resource "aws_s3_bucket" "access_logs" {
+resource "aws_s3_bucket" "access_logs" { # NOSONAR -- terminal log destination; logging it would create recursive S3 log delivery.
   bucket        = local.access_logs_bucket_name
   force_destroy = false
   tags          = merge(var.tags, { purpose = "access-logs" })
