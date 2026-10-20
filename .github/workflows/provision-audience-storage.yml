@@ -1,0 +1,156 @@
+name: Provision audience storage
+
+on:
+  workflow_dispatch:
+    inputs:
+      s3_prefix:
+        description: Must match S3_PREFIX configured in the audience service
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: provision-audience-storage-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  provision:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install browser dependencies
+        run: |
+          python -m pip install --disable-pip-version-check -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Install AWS CLI
+        run: python -m pip install --disable-pip-version-check awscli
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+
+      - name: Install Infisical CLI
+        run: |
+          curl -1sLf 'https://artifacts-cli.infisical.com/setup.deb.sh' | sudo -E bash
+          sudo apt-get update
+          sudo apt-get install -y infisical
+
+      - name: Prepare AWS Academy credentials
+        env:
+          INFISICAL_TOKEN: ${{ secrets.INFISICAL_TOKEN }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_PROJECT_ID }}
+          INFISICAL_ENV: ${{ secrets.INFISICAL_ENV }}
+          INFISICAL_PATH: ${{ secrets.INFISICAL_PATH }}
+          INFISICAL_HOST: ${{ secrets.INFISICAL_HOST }}
+        run: |
+          infisical run \
+            --token="$INFISICAL_TOKEN" \
+            --projectId="$INFISICAL_PROJECT_ID" \
+            --env="$INFISICAL_ENV" \
+            --path="$INFISICAL_PATH" \
+            --domain="$INFISICAL_HOST" \
+            -- python -m academy.bootstrap
+
+      - name: Import existing resources and apply Terraform
+        working-directory: terraform/audience-storage
+        env:
+          S3_PREFIX: ${{ inputs.s3_prefix }}
+        run: |
+          export TF_VAR_aws_region="${AWS_REGION:-us-east-1}"
+          export TF_VAR_s3_prefix="$S3_PREFIX"
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          BUCKET_NAME="ouros-audience-engine-${ACCOUNT_ID}"
+
+          terraform init -input=false
+
+          # The runner is ephemeral; import this service bucket into a local state on every dispatch.
+          if aws s3api head-bucket --bucket "$BUCKET_NAME" >/dev/null 2>&1; then
+            terraform import -input=false aws_s3_bucket.audience "$BUCKET_NAME"
+
+            public_block="$RUNNER_TEMP/audience-public-access.json"
+            public_block_error="$RUNNER_TEMP/audience-public-access-error.txt"
+            if aws s3api get-public-access-block --bucket "$BUCKET_NAME" >"$public_block" 2>"$public_block_error"; then
+              terraform import -input=false aws_s3_bucket_public_access_block.audience "$BUCKET_NAME"
+            elif ! grep -q 'NoSuchPublicAccessBlockConfiguration' "$public_block_error"; then
+              cat "$public_block_error" >&2
+              echo '::error::Could not safely inspect the audience bucket public access block.'
+              exit 1
+            fi
+
+            encryption="$RUNNER_TEMP/audience-encryption.json"
+            encryption_error="$RUNNER_TEMP/audience-encryption-error.txt"
+            if aws s3api get-bucket-encryption --bucket "$BUCKET_NAME" >"$encryption" 2>"$encryption_error"; then
+              if ! jq -e '
+                (.ServerSideEncryptionConfiguration.Rules | length == 1) and
+                .ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm == "AES256"
+              ' "$encryption" >/dev/null; then
+                echo '::error::The existing bucket has encryption settings this workflow will not replace.'
+                exit 1
+              fi
+              terraform import -input=false aws_s3_bucket_server_side_encryption_configuration.audience "$BUCKET_NAME"
+            elif ! grep -q 'ServerSideEncryptionConfigurationNotFoundError' "$encryption_error"; then
+              cat "$encryption_error" >&2
+              echo '::error::Could not safely inspect the audience bucket encryption.'
+              exit 1
+            fi
+
+            policy="$RUNNER_TEMP/audience-bucket-policy.json"
+            policy_error="$RUNNER_TEMP/audience-bucket-policy-error.txt"
+            if aws s3api get-bucket-policy --bucket "$BUCKET_NAME" --query Policy --output text >"$policy" 2>"$policy_error"; then
+              if ! jq -e --arg bucket_arn "arn:aws:s3:::$BUCKET_NAME" '
+                (.Statement | type == "array" and length == 1) and
+                .Statement[0].Sid == "DenyInsecureTransport" and
+                .Statement[0].Effect == "Deny" and
+                .Statement[0].Action == "s3:*" and
+                .Statement[0].Principal == "*" and
+                (.Statement[0].Resource | type == "array" and length == 2 and sort == [$bucket_arn, ($bucket_arn + "/*")]) and
+                .Statement[0].Condition.Bool["aws:SecureTransport"] == "false"
+              ' "$policy" >/dev/null; then
+                echo '::error::The existing bucket has a custom policy this workflow will not replace.'
+                exit 1
+              fi
+              terraform import -input=false aws_s3_bucket_policy.https_only "$BUCKET_NAME"
+            elif ! grep -q 'NoSuchBucketPolicy' "$policy_error"; then
+              cat "$policy_error" >&2
+              echo '::error::Could not safely inspect the audience bucket policy.'
+              exit 1
+            fi
+          fi
+
+          terraform plan -input=false -out=tfplan
+          terraform show -json tfplan > "$RUNNER_TEMP/audience-storage-plan.json"
+          unsafe_changes="$(jq -r '
+            [.resource_changes[]?
+              | select((.change.actions | index("delete")) != null)
+              | .address]
+            | .[]
+          ' "$RUNNER_TEMP/audience-storage-plan.json")"
+          if [ -n "$unsafe_changes" ]; then
+            printf '::error::Terraform plan contains destructive changes:\n%s\n' "$unsafe_changes"
+            exit 1
+          fi
+
+          terraform apply -input=false -auto-approve tfplan
+          {
+            echo '### Audience Engine S3 storage'
+            echo "- Bucket: \`$(terraform output -raw bucket_name)\`"
+            echo "- Region: \`$TF_VAR_aws_region\`"
+            echo "- S3 prefix: \`$(terraform output -raw s3_prefix)\`"
+            echo '- Attach this policy to the service AWS identity before use:'
+            echo '```json'
+            terraform output -raw runtime_access_policy_json | jq .
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
