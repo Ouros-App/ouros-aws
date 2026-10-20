@@ -73,12 +73,32 @@ jobs:
           export TF_VAR_s3_prefix="$S3_PREFIX"
           ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
           BUCKET_NAME="ouros-audience-engine-${ACCOUNT_ID}"
+          LOG_BUCKET="$(python -c 'import hashlib,sys; name=sys.argv[1]; print(name[:50] + "-logs-" + hashlib.sha256(name.encode()).hexdigest()[:6])' "$BUCKET_NAME")"
+          main_bucket_exists=false
+          import_audience_logging=false
 
           terraform init -input=false
 
           # The runner is ephemeral; import this service bucket into a local state on every dispatch.
           if aws s3api head-bucket --bucket "$BUCKET_NAME" >/dev/null 2>&1; then
+            main_bucket_exists=true
             terraform import -input=false aws_s3_bucket.audience "$BUCKET_NAME"
+
+            source_logging="$RUNNER_TEMP/audience-source-logging.json"
+            logging_error="$RUNNER_TEMP/audience-source-logging-error.txt"
+            if ! aws s3api get-bucket-logging --bucket "$BUCKET_NAME" >"$source_logging" 2>"$logging_error"; then
+              cat "$logging_error" >&2
+              echo '::error::Could not safely inspect the audience bucket logging configuration.'
+              exit 1
+            fi
+            if jq -e '.LoggingEnabled.TargetBucket' "$source_logging" >/dev/null; then
+              current_log_bucket="$(jq -r '.LoggingEnabled.TargetBucket' "$source_logging")"
+              if [ "$current_log_bucket" != "$LOG_BUCKET" ] || ! jq -e --arg prefix "$BUCKET_NAME/" '.LoggingEnabled.TargetPrefix == $prefix' "$source_logging" >/dev/null; then
+                echo '::error::The audience bucket has a different access-log destination or prefix.'
+                exit 1
+              fi
+              import_audience_logging=true
+            fi
 
             public_block="$RUNNER_TEMP/audience-public-access.json"
             public_block_error="$RUNNER_TEMP/audience-public-access-error.txt"
@@ -130,6 +150,74 @@ jobs:
             fi
           fi
 
+          if aws s3api head-bucket --bucket "$LOG_BUCKET" >/dev/null 2>&1; then
+            if [ "$main_bucket_exists" != true ]; then
+              echo '::error::The access-log bucket exists without its audience bucket; refusing to adopt it.'
+              exit 1
+            fi
+            terraform import -input=false aws_s3_bucket.access_logs "$LOG_BUCKET"
+
+            if aws s3api get-public-access-block --bucket "$LOG_BUCKET" >/dev/null 2>&1; then
+              terraform import -input=false aws_s3_bucket_public_access_block.access_logs "$LOG_BUCKET"
+            fi
+
+            logs_encryption_error="$RUNNER_TEMP/audience-logs-encryption-error.txt"
+            if logs_sse_algorithm="$(aws s3api get-bucket-encryption --bucket "$LOG_BUCKET" \
+              --query 'ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm' \
+              --output text 2>"$logs_encryption_error")"; then
+              if [ "$logs_sse_algorithm" != "AES256" ]; then
+                echo "::error::The access-log bucket uses $logs_sse_algorithm encryption; this workflow requires SSE-S3."
+                exit 1
+              fi
+              terraform import -input=false aws_s3_bucket_server_side_encryption_configuration.access_logs "$LOG_BUCKET"
+            elif ! grep -q 'ServerSideEncryptionConfigurationNotFoundError' "$logs_encryption_error"; then
+              cat "$logs_encryption_error" >&2
+              echo '::error::Could not safely inspect access-log bucket encryption.'
+              exit 1
+            fi
+
+            logs_policy="$RUNNER_TEMP/audience-logs-policy.json"
+            logs_policy_error="$RUNNER_TEMP/audience-logs-policy-error.txt"
+            if aws s3api get-bucket-policy --bucket "$LOG_BUCKET" --query Policy --output text >"$logs_policy" 2>"$logs_policy_error"; then
+              if jq -e --arg log_arn "arn:aws:s3:::$LOG_BUCKET" --arg source_arn "arn:aws:s3:::$BUCKET_NAME" --arg source_bucket "$BUCKET_NAME" --arg account_id "$ACCOUNT_ID" '
+                (.Statement | type == "array" and length == 2) and
+                ([.Statement[].Sid] | sort == ["AllowS3ServerAccessLogs", "DenyInsecureTransport"]) and
+                any(.Statement[]; .Sid == "AllowS3ServerAccessLogs" and .Effect == "Allow" and .Principal.Service == "logging.s3.amazonaws.com" and .Action == "s3:PutObject" and .Resource == ($log_arn + "/" + $source_bucket + "/*") and .Condition.ArnLike["aws:SourceArn"] == $source_arn and .Condition.StringEquals["aws:SourceAccount"] == $account_id) and
+                any(.Statement[]; .Sid == "DenyInsecureTransport" and .Effect == "Deny" and .Action == "s3:*" and .Principal == "*" and (.Resource | type == "array" and length == 2 and sort == [$log_arn, ($log_arn + "/*")]) and .Condition.Bool["aws:SecureTransport"] == "false")
+              ' "$logs_policy" >/dev/null; then
+                terraform import -input=false aws_s3_bucket_policy.access_logs "$LOG_BUCKET"
+              else
+                echo '::error::The access-log bucket has a custom policy this workflow will not replace.'
+                exit 1
+              fi
+            elif ! grep -q 'NoSuchBucketPolicy' "$logs_policy_error"; then
+              cat "$logs_policy_error" >&2
+              echo '::error::Could not safely inspect access-log bucket policy.'
+              exit 1
+            fi
+
+            logs_lifecycle="$RUNNER_TEMP/audience-logs-lifecycle.json"
+            logs_lifecycle_error="$RUNNER_TEMP/audience-logs-lifecycle-error.txt"
+            if aws s3api get-bucket-lifecycle-configuration --bucket "$LOG_BUCKET" >"$logs_lifecycle" 2>"$logs_lifecycle_error"; then
+              if jq -e --arg prefix "$BUCKET_NAME/" '
+                .Rules == [{"ID":"expire-access-logs","Filter":{"Prefix":$prefix},"Status":"Enabled","Expiration":{"Days":30}}]
+              ' "$logs_lifecycle" >/dev/null; then
+                terraform import -input=false aws_s3_bucket_lifecycle_configuration.access_logs "$LOG_BUCKET"
+              else
+                echo '::error::The access-log bucket has a custom lifecycle configuration this workflow will not replace.'
+                exit 1
+              fi
+            elif ! grep -q 'NoSuchLifecycleConfiguration' "$logs_lifecycle_error"; then
+              cat "$logs_lifecycle_error" >&2
+              echo '::error::Could not safely inspect access-log bucket lifecycle.'
+              exit 1
+            fi
+          fi
+
+          if [ "$import_audience_logging" = true ]; then
+            terraform import -input=false aws_s3_bucket_logging.audience "$BUCKET_NAME"
+          fi
+
           terraform plan -input=false -out=tfplan
           terraform show -json tfplan > "$RUNNER_TEMP/audience-storage-plan.json"
           unsafe_changes="$(jq -r '
@@ -146,6 +234,7 @@ jobs:
           terraform apply -input=false -auto-approve tfplan
           {
             echo '### Audience Engine S3 storage'
+            echo "- Access logs bucket: \`$(terraform output -raw access_logs_bucket_name)\` (30-day retention)"
             echo "- Bucket: \`$(terraform output -raw bucket_name)\`"
             echo "- Region: \`$TF_VAR_aws_region\`"
             echo "- S3 prefix: \`$(terraform output -raw s3_prefix)\`"

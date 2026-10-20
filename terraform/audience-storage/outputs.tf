@@ -6,6 +6,10 @@ output "bucket_arn" {
   value = aws_s3_bucket.audience.arn
 }
 
+output "access_logs_bucket_name" {
+  value = aws_s3_bucket.access_logs.bucket
+}
+
 output "s3_prefix" {
   value = var.s3_prefix
 }
