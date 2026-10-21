@@ -4,7 +4,7 @@ Automação de healthcheck para iniciar o AWS Academy Learner Lab pelo Canvas/Vo
 
 ## Arquitetura
 
-O workflow lê as credenciais do Canvas e a região da AWS do Infisical (`/aws-academy`), automatiza Canvas e Vocareum com Playwright, abre **Details → AWS: Show** e grava as credenciais somente no ambiente do runner. O painel atual fornece access key e secret key; se também fornecer um session token, ele será exportado. Em seguida, o fluxo valida a sessão com `aws sts get-caller-identity`. As credenciais não são gravadas em artefatos nem no repositório.
+O workflow lê as credenciais do Canvas e a região da AWS do Infisical (`/aws`), automatiza Canvas e Vocareum com Playwright, abre **Details → AWS: Show** e grava as credenciais somente no ambiente do runner. O painel atual fornece access key e secret key; se também fornecer um session token, ele será exportado. Em seguida, o fluxo valida a sessão com `aws sts get-caller-identity`. As credenciais não são gravadas em artefatos nem no repositório.
 
 ## Configuração
 
@@ -15,12 +15,12 @@ No GitHub → Settings → Secrets and variables → Actions, cadastre os cinco 
 | `INFISICAL_TOKEN` | Token de acesso aceito pela CLI do Infisical |
 | `INFISICAL_PROJECT_ID` | ID do projeto Infisical (não o slug) |
 | `INFISICAL_ENV` | Slug do ambiente, por exemplo `dev` ou `prod` |
-| `INFISICAL_PATH` | Path dos secrets, por exemplo `/aws-academy` |
+| `INFISICAL_PATH` | Path dos secrets, por exemplo `/aws` |
 | `INFISICAL_HOST` | URL da instalação, por exemplo `https://app.infisical.com` |
 
 O token deve ter permissão de leitura somente no projeto, ambiente e path necessários. Os workflows passam esses valores à Infisical CLI e carregam as configurações do Canvas no processo do bootstrap.
 
-No Infisical, crie no path `/aws-academy`:
+No Infisical, crie no path `/aws`:
 
 | Secret | Obrigatório | Uso |
 | --- | --- | --- |
