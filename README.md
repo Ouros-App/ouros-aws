@@ -37,15 +37,30 @@ O login institucional pode exigir MFA ou CAPTCHA. O fluxo não tenta contornar e
 
 Execute manualmente **AWS Academy healthcheck** em Actions → workflow_dispatch. O job instala Chromium, carrega configuração do Infisical, inicia o laboratório e valida a identidade STS. Nenhum deploy é feito.
 
-Para desenvolvimento local, instale Python, AWS CLI e Playwright, carregue as variáveis por um mecanismo seguro e rode:
+Para desenvolvimento local, instale Python, AWS CLI, Playwright e Infisical CLI. Crie `.env` a partir do exemplo se ainda não existir, preencha as cinco chaves `INFISICAL_*` e rode:
 
 ```bash
 python -m pip install -r requirements.txt
 python -m playwright install chromium
-python -m academy.bootstrap
+test -f .env || cp .env.example .env
+set -a
+. ./.env
+set +a
+infisical run \
+  --projectId="$INFISICAL_PROJECT_ID" \
+  --env="$INFISICAL_ENV" \
+  --path="$INFISICAL_PATH" \
+  --domain="$INFISICAL_HOST" \
+  -- python -m academy.bootstrap
 ```
 
-Localmente, `GITHUB_ENV` não existe e o bootstrap recusa imprimir credenciais. Para validar manualmente, adapte o uso para um mecanismo temporário seguro; não salve as credenciais em arquivos persistentes.
+O bootstrap valida localmente a sessão temporária com STS sem imprimir nem salvar credenciais. O serviço usa Moto no Compose para testes S3 locais; não precisa de bucket AWS nem de Keycloak.
+
+## Audience engine S3 storage
+
+O workflow manual **Provision audience storage** cria o bucket privado `ouros-audience-engine-<AWS_ACCOUNT_ID>` para os snapshots do serviço. É separado de **Deploy to S3**, que sincroniza arquivos estáticos com `--delete`. O bucket bloqueia acesso público, usa SSE-S3, exige HTTPS e envia access logs para um segundo bucket privado com retenção de 30 dias. Os snapshots não têm versionamento nem expiração até a política de retenção ser definida; armazenamento e requisições de log podem gerar custos AWS.
+
+O workflow mostra o bucket e a policy mínima para a identidade AWS do serviço: `s3:ListBucket` no bucket (necessário ao `HeadBucket` do healthcheck) e `s3:GetObject`/`s3:PutObject` somente em `audiences/*` dentro do `S3_PREFIX` configurado; sem exclusão. A policy é apenas gerada como output: este repositório não cria nem anexa uma identidade de execução. Configure `S3_BUCKET` com o nome informado e mantenha `S3_PREFIX` igual ao input; `*` e `?` são rejeitados para limitar a policy.
 
 ## Deploy S3
 
