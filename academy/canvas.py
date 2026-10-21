@@ -39,9 +39,8 @@ def _open_course(page, config):
 
 
 def _course_locator(page, course_name):
-    return page.get_by_role("link", name=course_name, exact=False).or_(
-        page.get_by_text(course_name, exact=False)
-    )
+    link = page.get_by_role("link", name=course_name, exact=False)
+    return link if link.count() else page.get_by_text(course_name, exact=False)
 
 
 def _open_modules(page):

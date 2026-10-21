@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from academy.canvas import _open_course
+from academy.canvas import _course_locator, _open_course
 from academy.config import load_config
 from academy.credentials import export_github_env, parse_aws_details
 from academy.exceptions import AwsDetailsNotFound, ConfigurationError, CredentialsInvalid, LabTimeout
@@ -92,6 +92,26 @@ class CredentialTests(unittest.TestCase):
 
 
 class NavigationTests(unittest.TestCase):
+    def test_course_locator_prefers_link_when_text_matches_too(self):
+        page = Mock()
+        link = Mock()
+        link.count.return_value = 2
+        page.get_by_role.return_value = link
+        page.get_by_text.return_value = Mock()
+
+        self.assertIs(_course_locator(page, "AWS Academy Cloud Foundations"), link)
+        page.get_by_text.assert_not_called()
+
+    def test_course_locator_falls_back_to_text_when_no_link_matches(self):
+        page = Mock()
+        link = Mock()
+        link.count.return_value = 0
+        page.get_by_role.return_value = link
+        text = Mock()
+        page.get_by_text.return_value = text
+
+        self.assertIs(_course_locator(page, "AWS Academy Cloud Foundations"), text)
+
     def test_waits_for_configured_course_before_using_fallback(self):
         configured_course = Mock()
         fallback_course = Mock()
