@@ -434,7 +434,7 @@ def main() -> int:
         provisioner = S3Provisioner(region, identity["Account"], partition)
         policy = provisioner.provision(prefix)
         append_summary(provisioner, prefix, policy)
-    except (AwsCliError, ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
+    except (ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
         print(f"::error::{exc}", file=sys.stderr)
         return 1
     return 0

@@ -1,10 +1,16 @@
 import hashlib
+import json
+import os
+import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from scripts.provision_audience_storage import (
+    AwsCliError,
     S3Provisioner,
+    append_summary,
     bucket_names,
+    main,
     normalize_prefix,
     runtime_policy,
 )
@@ -73,6 +79,137 @@ class AudienceStoragePolicyTests(unittest.TestCase):
 
         ensure_bucket.assert_not_called()
 
+
+
+class ProvisioningFlowTests(unittest.TestCase):
+    def test_creates_and_verifies_buckets_without_object_lock_api(self):
+        provisioner = S3Provisioner("us-east-1", "123456789012", "aws")
+        state = {
+            "tags": {},
+            "encrypted": set(),
+            "policies": {},
+            "lifecycle": None,
+            "logging": None,
+            "public_access": set(),
+            "calls": [],
+        }
+
+        def run(*args):
+            operation = args[0]
+            state["calls"].append(operation)
+            name = args[args.index("--bucket") + 1] if "--bucket" in args else None
+
+            if operation == "head-bucket":
+                raise AwsCliError(list(args), "An error occurred (404) when calling HeadBucket")
+            if operation == "create-bucket":
+                return ""
+            if operation == "get-bucket-tagging":
+                if name not in state["tags"]:
+                    raise AwsCliError(list(args), "An error occurred (NoSuchTagSet) when calling GetBucketTagging")
+                return json.dumps({"TagSet": state["tags"][name]})
+            if operation == "put-bucket-tagging":
+                state["tags"][name] = json.loads(args[args.index("--tagging") + 1])["TagSet"]
+                return ""
+            if operation == "put-public-access-block":
+                state["public_access"].add(name)
+                return ""
+            if operation == "get-public-access-block":
+                return json.dumps({
+                    "PublicAccessBlockConfiguration": {
+                        "BlockPublicAcls": True,
+                        "IgnorePublicAcls": True,
+                        "BlockPublicPolicy": True,
+                        "RestrictPublicBuckets": True,
+                    }
+                })
+            if operation == "get-bucket-encryption":
+                if name not in state["encrypted"]:
+                    raise AwsCliError(list(args), "An error occurred (ServerSideEncryptionConfigurationNotFoundError) when calling GetBucketEncryption")
+                return json.dumps({"ServerSideEncryptionConfiguration": {"Rules": [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}]}})
+            if operation == "put-bucket-encryption":
+                state["encrypted"].add(name)
+                return ""
+            if operation == "get-bucket-policy":
+                if name not in state["policies"]:
+                    raise AwsCliError(list(args), "An error occurred (NoSuchBucketPolicy) when calling GetBucketPolicy")
+                return json.dumps({"Policy": json.dumps(state["policies"][name])})
+            if operation == "put-bucket-policy":
+                state["policies"][name] = json.loads(args[args.index("--policy") + 1])
+                return ""
+            if operation == "get-bucket-lifecycle-configuration":
+                if state["lifecycle"] is None:
+                    raise AwsCliError(list(args), "An error occurred (NoSuchLifecycleConfiguration) when calling GetBucketLifecycleConfiguration")
+                return json.dumps(state["lifecycle"])
+            if operation == "put-bucket-lifecycle-configuration":
+                state["lifecycle"] = json.loads(args[args.index("--lifecycle-configuration") + 1])
+                return ""
+            if operation == "get-bucket-logging":
+                return json.dumps({"LoggingEnabled": state["logging"]} if state["logging"] else {})
+            if operation == "put-bucket-logging":
+                state["logging"] = json.loads(args[args.index("--bucket-logging-status") + 1])["LoggingEnabled"]
+                return ""
+            self.fail(f"Unexpected AWS CLI operation: {operation}")
+
+        with patch.object(provisioner, "_run", side_effect=run):
+            policy = provisioner.provision("tenant-a")
+
+        self.assertEqual(policy, runtime_policy(provisioner.bucket_arn, "tenant-a"))
+        self.assertEqual(state["public_access"], {provisioner.bucket, provisioner.access_logs_bucket})
+        self.assertEqual(state["encrypted"], {provisioner.bucket, provisioner.access_logs_bucket})
+        self.assertIn("service", {tag["Key"] for tag in state["tags"][provisioner.bucket]})
+        self.assertIn("purpose", {tag["Key"] for tag in state["tags"][provisioner.access_logs_bucket]})
+        self.assertEqual(state["logging"]["TargetBucket"], provisioner.access_logs_bucket)
+        self.assertNotIn("get-bucket-object-lock-configuration", state["calls"])
+
+    def test_rejects_incompatible_existing_encryption(self):
+        provisioner = S3Provisioner("us-east-1", "123456789012", "aws")
+        with (
+            patch.object(
+                provisioner,
+                "_optional_json",
+                return_value={
+                    "ServerSideEncryptionConfiguration": {
+                        "Rules": [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "aws:kms"}}]
+                    }
+                },
+            ),
+            patch.object(provisioner, "_run") as run,
+            self.assertRaisesRegex(RuntimeError, "will not replace"),
+        ):
+            provisioner.ensure_encryption(provisioner.bucket)
+        run.assert_not_called()
+
+    def test_aws_cli_error_extracts_service_error_code(self):
+        error = AwsCliError(["s3api", "head-bucket"], "An error occurred (403) when calling HeadBucket")
+        self.assertEqual(error.code, "403")
+
+    def test_main_rejects_wildcard_prefix(self):
+        with patch.dict(os.environ, {"S3_PREFIX": "bad/*"}, clear=True):
+            self.assertEqual(main(), 1)
+
+    def test_main_provisions_and_writes_summary(self):
+        instance = Mock()
+        instance.provision.return_value = {"Version": "2012-10-17"}
+        with (
+            patch.dict(os.environ, {"S3_PREFIX": "/tenant-a/"}, clear=True),
+            patch("scripts.provision_audience_storage.subprocess.run", return_value=Mock(
+                stdout=json.dumps({"Arn": "arn:aws:iam::123456789012:role/test", "Account": "123456789012"})
+            )),
+            patch("scripts.provision_audience_storage.S3Provisioner", return_value=instance),
+            patch("scripts.provision_audience_storage.append_summary") as write_summary,
+        ):
+            self.assertEqual(main(), 0)
+        instance.provision.assert_called_once_with("tenant-a")
+        write_summary.assert_called_once_with(instance, "tenant-a", {"Version": "2012-10-17"})
+
+    def test_summary_appends_to_github_step_summary(self):
+
+        provisioner = S3Provisioner("us-east-1", "123456789012", "aws")
+        with tempfile.NamedTemporaryFile(mode="r+", encoding="utf-8") as summary:
+            with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": summary.name}, clear=True):
+                append_summary(provisioner, "", {})
+            summary.seek(0)
+            self.assertIn(provisioner.bucket, summary.read())
 
 if __name__ == "__main__":
     unittest.main()
