@@ -32,7 +32,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Ouros-App/ms-ouros-audience-engine
-          ref: feat/audience-engine-mvp
+          # Pin reviewed service code; the container receives temporary AWS credentials.
+          ref: d4e1767286659af403a2686393aaef0fe9260a46
           path: audience-engine
           persist-credentials: false
 
