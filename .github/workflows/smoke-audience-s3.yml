@@ -102,6 +102,10 @@ jobs:
         working-directory: audience-engine
         run: docker compose up --detach --wait postgres redis
 
+      - name: Build audience engine image
+        working-directory: audience-engine
+        run: docker compose build --quiet api
+
       - name: Publish to and read from production S3
         id: smoke
         working-directory: audience-engine
@@ -110,7 +114,7 @@ jobs:
         run: |
           set -o pipefail
           run_audience() {
-            docker compose run --rm --no-deps \
+            docker compose run --no-build --rm --no-deps \
               -e AWS_ACCESS_KEY_ID \
               -e AWS_SECRET_ACCESS_KEY \
               -e AWS_SESSION_TOKEN \
