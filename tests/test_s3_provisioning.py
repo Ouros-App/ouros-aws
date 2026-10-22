@@ -1,11 +1,13 @@
 import hashlib
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
 from scripts.provision_audience_storage import (
+    AWS_CLI_TIMEOUT_SECONDS,
     AwsCliError,
     S3Provisioner,
     append_summary,
@@ -183,23 +185,56 @@ class ProvisioningFlowTests(unittest.TestCase):
         error = AwsCliError(["s3api", "head-bucket"], "An error occurred (403) when calling HeadBucket")
         self.assertEqual(error.code, "403")
 
+    def test_aws_cli_subprocess_uses_timeout(self):
+        provisioner = S3Provisioner("us-east-1", "123456789012", "aws")
+        with patch(
+            "scripts.provision_audience_storage.subprocess.run",
+            return_value=Mock(returncode=0, stdout="ok"),
+        ) as run_aws:
+            self.assertEqual(provisioner._run("list-buckets"), "ok")
+        self.assertEqual(run_aws.call_args.kwargs["timeout"], AWS_CLI_TIMEOUT_SECONDS)
+
+
     def test_main_rejects_wildcard_prefix(self):
         with patch.dict(os.environ, {"S3_PREFIX": "bad/*"}, clear=True):
             self.assertEqual(main(), 1)
+
+    def test_main_reports_timeout_and_missing_aws_cli(self):
+        errors = (
+            subprocess.TimeoutExpired(["aws"], AWS_CLI_TIMEOUT_SECONDS),
+            FileNotFoundError("aws"),
+        )
+        for error in errors:
+            with self.subTest(error=type(error).__name__):
+                with (
+                    patch.dict(os.environ, {"S3_PREFIX": ""}, clear=True),
+                    patch("scripts.provision_audience_storage.subprocess.run", side_effect=error),
+                    patch("builtins.print") as report_error,
+                ):
+                    self.assertEqual(main(), 1)
+                self.assertTrue(report_error.call_args.args[0].startswith("::error::"))
+
 
     def test_main_provisions_and_writes_summary(self):
         instance = Mock()
         instance.provision.return_value = {"Version": "2012-10-17"}
         with (
             patch.dict(os.environ, {"S3_PREFIX": "/tenant-a/"}, clear=True),
-            patch("scripts.provision_audience_storage.subprocess.run", return_value=Mock(
-                stdout=json.dumps({"Arn": "arn:aws:iam::123456789012:role/test", "Account": "123456789012"})
-            )),
+            patch(
+                "scripts.provision_audience_storage.subprocess.run",
+                return_value=Mock(
+                    stdout=json.dumps({
+                        "Arn": "arn:aws:iam::123456789012:role/test",
+                        "Account": "123456789012",
+                    })
+                ),
+            ) as run_aws,
             patch("scripts.provision_audience_storage.S3Provisioner", return_value=instance),
             patch("scripts.provision_audience_storage.append_summary") as write_summary,
         ):
             self.assertEqual(main(), 0)
         instance.provision.assert_called_once_with("tenant-a")
+        self.assertEqual(run_aws.call_args.kwargs["timeout"], AWS_CLI_TIMEOUT_SECONDS)
         write_summary.assert_called_once_with(instance, "tenant-a", {"Version": "2012-10-17"})
 
     def test_summary_appends_to_github_step_summary(self):

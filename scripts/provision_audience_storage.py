@@ -10,6 +10,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+AWS_CLI_TIMEOUT_SECONDS = 300
+
 
 class AwsCliError(RuntimeError):
     def __init__(self, command: list[str], stderr: str) -> None:
@@ -64,7 +66,11 @@ class S3Provisioner:
     def _run(self, *args: str) -> str:
         command = ["s3api", *args, "--region", self.region]
         result = subprocess.run(
-            ["aws", *command], capture_output=True, check=False, text=True
+            ["aws", *command],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=AWS_CLI_TIMEOUT_SECONDS,
         )
         if result.returncode:
             raise AwsCliError(command, result.stderr)
@@ -422,19 +428,25 @@ def main() -> int:
     try:
         prefix = normalize_prefix(os.environ.get("S3_PREFIX", ""))
         region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
-        identity = json.loads(
-            subprocess.run(
-                ["aws", "sts", "get-caller-identity", "--region", region, "--output", "json"],
-                capture_output=True,
-                check=True,
-                text=True,
-            ).stdout
-        )
+        identity_output = subprocess.run(
+            ["aws", "sts", "get-caller-identity", "--region", region, "--output", "json"],
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=AWS_CLI_TIMEOUT_SECONDS,
+        ).stdout
+        identity = json.loads(identity_output)
         partition = identity["Arn"].split(":", 2)[1]
         provisioner = S3Provisioner(region, identity["Account"], partition)
         policy = provisioner.provision(prefix)
         append_summary(provisioner, prefix, policy)
-    except (ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
+    except (
+        ValueError,
+        RuntimeError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        FileNotFoundError,
+    ) as exc:
         print(f"::error::{exc}", file=sys.stderr)
         return 1
     return 0
