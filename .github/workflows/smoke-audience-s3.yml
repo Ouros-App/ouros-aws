@@ -1,0 +1,150 @@
+name: Smoke test audience S3
+
+on:
+  workflow_dispatch:
+    inputs:
+      s3_prefix:
+        description: Must match S3_PREFIX configured in the audience service
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: smoke-audience-s3-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout AWS automation
+        uses: actions/checkout@v4
+        with:
+          path: aws-automation
+          persist-credentials: false
+
+      - name: Checkout audience engine
+        uses: actions/checkout@v4
+        with:
+          repository: Ouros-App/ms-ouros-audience-engine
+          ref: main
+          path: audience-engine
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install browser dependencies
+        working-directory: aws-automation
+        run: |
+          python -m pip install --disable-pip-version-check -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Install AWS CLI
+        run: python -m pip install --disable-pip-version-check awscli
+
+      - name: Install Infisical CLI
+        run: |
+          curl -1sLf 'https://artifacts-cli.infisical.com/setup.deb.sh' | sudo -E bash
+          sudo apt-get update
+          sudo apt-get install -y infisical
+
+      - name: Prepare AWS Academy credentials
+        id: bootstrap
+        working-directory: aws-automation
+        env:
+          INFISICAL_TOKEN: ${{ secrets.INFISICAL_TOKEN }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_PROJECT_ID }}
+          INFISICAL_ENV: ${{ secrets.INFISICAL_ENV }}
+          INFISICAL_PATH: ${{ secrets.INFISICAL_PATH }}
+          INFISICAL_HOST: ${{ secrets.INFISICAL_HOST }}
+        run: |
+          infisical run \
+            --projectId="$INFISICAL_PROJECT_ID" \
+            --env="$INFISICAL_ENV" \
+            --path="$INFISICAL_PATH" \
+            --domain="$INFISICAL_HOST" \
+            -- python -m academy.bootstrap
+
+      - name: Resolve isolated smoke target
+        id: target
+        working-directory: aws-automation
+        run: |
+          account_id="$(aws sts get-caller-identity --query Account --output text --region us-east-1)"
+          echo "S3_BUCKET=ouros-audience-engine-${account_id}" >> "$GITHUB_ENV"
+          echo "SMOKE_AUDIENCE_KEY=smoke_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
+
+      - name: Prepare synthetic audience key
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          path = Path("audience-engine/config/audiences.demo.yaml")
+          config = path.read_text(encoding="utf-8")
+          old = "key: high_water_consumption"
+          if config.count(old) != 1:
+              raise SystemExit("expected exactly one demo audience key to replace")
+          path.write_text(
+              config.replace(old, f"key: {os.environ['SMOKE_AUDIENCE_KEY']}"),
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Start isolated Postgres and Redis
+        working-directory: audience-engine
+        run: docker compose up --detach --wait postgres redis
+
+      - name: Publish to and read from production S3
+        id: smoke
+        working-directory: audience-engine
+        env:
+          S3_PREFIX: ${{ inputs.s3_prefix }}
+        run: |
+          set -o pipefail
+          run_audience() {
+            docker compose run --rm --no-deps \
+              -e AWS_ACCESS_KEY_ID \
+              -e AWS_SECRET_ACCESS_KEY \
+              -e AWS_SESSION_TOKEN \
+              -e ENVIRONMENT=development \
+              -e SOURCE_DATABASE_URL=postgresql://audience_source:audience_source_local_only@postgres:5432/audience \
+              -e METADATA_DATABASE_URL=postgresql://audience_metadata:audience_metadata_local_only@postgres:5432/audience \
+              -e REDIS_URL=redis://redis:6379/0 \
+              -e S3_ENDPOINT_URL= \
+              -e S3_BUCKET \
+              -e S3_REGION=us-east-1 \
+              -e S3_PREFIX \
+              -e S3_ACCESS_KEY_ID= \
+              -e S3_SECRET_ACCESS_KEY= \
+              -e S3_USE_SSL=true \
+              -e AUDIENCE_CONFIG_PATH=/app/config/audiences.demo.yaml \
+              api ouros-audience-engine run-once "$@"
+          }
+
+          run_audience --publish | tee "$RUNNER_TEMP/publish.json"
+          jq -e 'length == 1 and .[0].status == "PUBLISHED" and .[0].snapshot_version == 1' "$RUNNER_TEMP/publish.json" >/dev/null
+
+          run_audience --dry-run | tee "$RUNNER_TEMP/readback.json"
+          jq -e 'length == 1 and (.[0].status == "UNCHANGED" or .[0].status == "DRY_RUN") and .[0].snapshot_version >= 1' "$RUNNER_TEMP/readback.json" >/dev/null
+
+      - name: Remove isolated smoke objects
+        if: always() && steps.bootstrap.outcome == 'success' && steps.target.outcome == 'success'
+        working-directory: aws-automation
+        env:
+          S3_PREFIX: ${{ inputs.s3_prefix }}
+        run: |
+          prefix="$(python -c 'import os; from scripts.provision_audience_storage import normalize_prefix; print(normalize_prefix(os.environ["S3_PREFIX"]))')"
+          key_prefix="${prefix:+${prefix}/}audiences/${SMOKE_AUDIENCE_KEY}/"
+          aws s3 rm "s3://${S3_BUCKET}/${key_prefix}" --recursive --only-show-errors --region us-east-1
+
+      - name: Stop isolated Postgres and Redis
+        if: always()
+        working-directory: audience-engine
+        run: docker compose down --volumes
