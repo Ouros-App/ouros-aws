@@ -58,7 +58,7 @@ O bootstrap valida localmente a sessão temporária com STS sem imprimir nem sal
 
 ## Audience engine S3 storage
 
-O workflow manual **Provision audience storage** cria o bucket privado `ouros-audience-engine-<AWS_ACCOUNT_ID>` para os snapshots do serviço. É separado de **Deploy to S3**, que sincroniza arquivos estáticos com `--delete`. O bucket bloqueia acesso público, usa SSE-S3, exige HTTPS e envia access logs para um segundo bucket privado com retenção de 30 dias. Os snapshots não têm versionamento nem expiração até a política de retenção ser definida; armazenamento e requisições de log podem gerar custos AWS.
+O workflow manual **Provision audience storage** provisiona e reconcilia diretamente pela AWS CLI o bucket privado `ouros-audience-engine-<AWS_ACCOUNT_ID>` para os snapshots do serviço, sem Terraform. É separado de **Deploy to S3**, que sincroniza arquivos estáticos com `--delete`. O bucket bloqueia acesso público, usa SSE-S3, exige HTTPS e envia access logs para um segundo bucket privado com retenção de 30 dias. Os snapshots não têm versionamento nem expiração até a política de retenção ser definida; armazenamento e requisições de log podem gerar custos AWS.
 
 O workflow mostra o bucket e a policy mínima para a identidade AWS do serviço: `s3:ListBucket` no bucket (necessário ao `HeadBucket` do healthcheck) e `s3:GetObject`/`s3:PutObject` somente em `audiences/*` dentro do `S3_PREFIX` configurado; sem exclusão. A policy é apenas gerada como output: este repositório não cria nem anexa uma identidade de execução. Configure `S3_BUCKET` com o nome informado e mantenha `S3_PREFIX` igual ao input; `*` e `?` são rejeitados para limitar a policy.
 
